@@ -4,7 +4,7 @@
  *
  * Для сборки:
  *  - Сохраните этот код в файл vdisk.c.
- *  - Создайте Makefile (см. ниже) и выполните команду: make
+ *  - Создайте Makefile (см. ниже) и выполните: make
  *
  * Пример Makefile:
  * -------------------------------------------------
@@ -42,9 +42,9 @@
 /* Структура устройства */
 struct vdisk_dev {
     unsigned int size;           /* Размер устройства (в байтах) */
-    u8 *data;                  /* Буфер, имитирующий содержимое диска */
-    spinlock_t lock;           /* Для синхронизации */
-    struct gendisk *gd;        /* Структура описания блочного устройства */
+    u8 *data;                    /* Буфер, имитирующий содержимое диска */
+    spinlock_t lock;             /* Для синхронизации */
+    struct gendisk *gd;          /* Структура описания блочного устройства */
     struct request_queue *queue; /* Очередь запросов через blk-mq */
 };
 
@@ -55,14 +55,22 @@ static struct vdisk_dev *device = NULL;
 static struct blk_mq_tag_set vdisk_tag_set;
 
 /*
- * Функция-обработчик запросов blk-mq.
- * Использует blk_mq_rq_to_disk() для получения указателя на struct gendisk.
+ * Если функция blk_mq_rq_to_disk отсутствует в заголовках, определяем её сами.
+ */
+#ifndef blk_mq_rq_to_disk
+static inline struct gendisk *blk_mq_rq_to_disk(struct request *rq)
+{
+    return rq->q->disk;
+}
+#endif
+
+/*
+ * Функция-обработчик запросов через blk-mq.
  */
 static blk_status_t vdisk_mq_request(struct blk_mq_hw_ctx *hctx,
                                      const struct blk_mq_queue_data *bd)
 {
     struct request *req = bd->rq;
-    /* Получаем gendisk через вспомогательную функцию */
     struct gendisk *gd = blk_mq_rq_to_disk(req);
     struct vdisk_dev *dev = gd->private_data;
     blk_status_t status = BLK_STS_OK;
@@ -113,7 +121,6 @@ static void vdisk_release(struct gendisk *gd, fmode_t mode)
 
 /*
  * IOCTL-обработчик для сохранения/восстановления образа.
- * Обратите внимание, что сигнатура соответствует блочным устройствам.
  */
 static int vdisk_ioctl(struct block_device *bdev, fmode_t mode,
                        unsigned int cmd, unsigned long arg)
@@ -239,18 +246,19 @@ static int __init vdisk_init(void)
 
     major_num = register_blkdev(0, "vdisk");
     if (major_num <= 0) {
-        blk_mq_free_queue(device->queue);
+        /* Для ядра 6.1 используем blk_cleanup_queue */
+        blk_cleanup_queue(device->queue);
         blk_mq_free_tag_set(&vdisk_tag_set);
         vfree(device->data);
         kfree(device);
         return -EBUSY;
     }
 
-    /* Используем alloc_disk_node вместо alloc_disk */
-    device->gd = alloc_disk_node(VDISK_MINOR_CNT, NUMA_NO_NODE);
+    /* Для ядра 6.1 используем alloc_disk() */
+    device->gd = alloc_disk(VDISK_MINOR_CNT);
     if (!device->gd) {
         unregister_blkdev(major_num, "vdisk");
-        blk_mq_free_queue(device->queue);
+        blk_cleanup_queue(device->queue);
         blk_mq_free_tag_set(&vdisk_tag_set);
         vfree(device->data);
         kfree(device);
@@ -265,7 +273,6 @@ static int __init vdisk_init(void)
     set_capacity(device->gd, device->size / VDISK_SECTOR_SIZE);
     device->gd->queue = device->queue;
 
-    /* add_disk возвращает значение, но здесь можно проигнорировать */
     (void)add_disk(device->gd);
 
     pr_info("vdisk: Драйвер загружен. major = %d, размер = %u байт\n",
@@ -278,8 +285,7 @@ static void __exit vdisk_exit(void)
     del_gendisk(device->gd);
     put_disk(device->gd);
     unregister_blkdev(major_num, "vdisk");
-    /* Освобождаем очередь через blk_mq_free_queue вместо blk_cleanup_queue */
-    blk_mq_free_queue(device->queue);
+    blk_cleanup_queue(device->queue);
     blk_mq_free_tag_set(&vdisk_tag_set);
     vfree(device->data);
     kfree(device);

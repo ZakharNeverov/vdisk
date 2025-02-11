@@ -1,111 +1,63 @@
 /*
- * vdisk.c - Пример драйвера виртуального блочного устройства с поддержкой
- * сохранения/восстановления образа для ядра 6.1.0-31-amd64.
+ * vdisk.c - Драйвер виртуального диска с возможностью сохранения и восстановления образа
  *
- * Для сборки:
- *   - Сохраните этот код в файл vdisk.c.
- *   - Создайте рядом Makefile со следующим содержимым:
+ * Этот модуль реализует виртуальное блочное устройство, данные которого хранятся в памяти.
+ * Предусмотрены две команды ioctl для сохранения образа диска в файл и восстановления из файла.
  *
- *       obj-m += vdisk.o
- *       all:
- *           make -C /lib/modules/$(shell uname -r)/build M=$(PWD) modules
- *       clean:
- *           make -C /lib/modules/$(shell uname -r)/build M=$(PWD) clean
+ * Требования:
+ *   - Ядро: 6.1.0-31-amd64
+ *   - Компиляция: make -C /lib/modules/$(uname -r)/build M=$(pwd) modules
  *
- * Замечание:
- *   В ядре 6.1.0-31 вместо функции blk_mq_free_queue используем blk_cleanup_queue,
- *   а alloc_disk_node заменяем на alloc_disk.
+ * Пример использования:
+ *   1. Соберите модуль и загрузите его (insmod).
+ *   2. Устройство появится под именем /dev/vdisk.
+ *   3. С помощью пользовательской утилиты (или простого тестового приложения) можно вызвать ioctl:
+ *        - VDISK_IOCTL_SAVE    – сохранить образ в файл (по умолчанию /var/vdisk.img)
+ *        - VDISK_IOCTL_RESTORE – восстановить образ из файла.
  */
 
 #include <linux/module.h>
-#include <linux/kernel.h>
-#include <linux/init.h>
 #include <linux/blkdev.h>
-#include <linux/blk-mq.h>
-#include <linux/vmalloc.h>
-#include <linux/spinlock.h>
-#include <linux/slab.h>
-#include <linux/uaccess.h>
-#include <linux/ioctl.h>
+#include <linux/hdreg.h>
 #include <linux/fs.h>
+#include <linux/genhd.h>
+#include <linux/vmalloc.h>
+#include <linux/bio.h>
+#include <linux/spinlock.h>
+#include <linux/uaccess.h>
+#include <linux/slab.h>
+#include <linux/init.h>
+#include <linux/version.h>
+#include <linux/file.h>
+#include <linux/fcntl.h>
 
-/* Параметры виртуального диска */
-#define VDISK_MINOR_CNT      16
-#define VDISK_SECTOR_SIZE    512
-#define VDISK_SIZE           (16 * 1024 * 1024)  /* 16 МБ */
+#define VDISK_MAJOR         240
+#define VDISK_MINOR_CNT     16
+#define VDISK_SECTOR_SIZE   512
+#define VDISK_NUM_SECTORS   2048  /* 2048 секторов по 512 байт – около 1 МБ (при необходимости можно изменить) */
 
-/* Определение IOCTL-команд */
-#define VDISK_IOCTL_MAGIC       'V'
-#define VDISK_IOCTL_SAVE_IMAGE  _IOW(VDISK_IOCTL_MAGIC, 0, char*)
-#define VDISK_IOCTL_LOAD_IMAGE  _IOW(VDISK_IOCTL_MAGIC, 1, char*)
+/* Путь к файлу для сохранения/восстановления образа можно задать как параметр модуля */
+static char *vdisk_image = "/var/vdisk.img";
+module_param(vdisk_image, charp, 0644);
+MODULE_PARM_DESC(vdisk_image, "Путь к файлу для сохранения/восстановления образа виртуального диска");
 
-/* Структура устройства */
+#define VDISK_IOCTL_MAGIC   'v'
+#define VDISK_IOCTL_SAVE    _IO(VDISK_IOCTL_MAGIC, 1)
+#define VDISK_IOCTL_RESTORE _IO(VDISK_IOCTL_MAGIC, 2)
+
+/* Структура, описывающая устройство */
 struct vdisk_dev {
-    unsigned int size;           /* Размер в байтах */
-    u8 *data;                    /* Буфер, имитирующий содержимое диска */
-    spinlock_t lock;             /* Для синхронизации */
-    struct gendisk *gd;          /* Структура описания блочного устройства */
-    struct request_queue *queue; /* Очередь запросов через blk-mq */
+    int size;          /* Размер устройства в байтах */
+    u8 *data;          /* Указатель на область памяти, где хранятся данные */
+    spinlock_t lock;   /* Мьютекс для синхронизации */
+    struct request_queue *queue;
+    struct gendisk *gd;
 };
 
-static int major_num = 0;
-static struct vdisk_dev *device = NULL;
+static struct vdisk_dev *vdisk_device = NULL;
+static struct blk_mq_tag_set *vdisk_tag_set = NULL;
 
-/* Глобальный tag_set для blk-mq */
-static struct blk_mq_tag_set vdisk_tag_set;
-
-/* Если функция blk_mq_rq_to_disk отсутствует, определяем её самостоятельно */
-#ifndef blk_mq_rq_to_disk
-static inline struct gendisk *blk_mq_rq_to_disk(struct request *rq)
-{
-    return rq->q->disk;
-}
-#endif
-
-/*
- * Функция-обработчик запросов (blk-mq)
- */
-static blk_status_t vdisk_mq_request(struct blk_mq_hw_ctx *hctx,
-                                     const struct blk_mq_queue_data *bd)
-{
-    struct request *req = bd->rq;
-    struct gendisk *gd = blk_mq_rq_to_disk(req);
-    struct vdisk_dev *dev = gd->private_data;
-    blk_status_t status = BLK_STS_OK;
-    unsigned long offset = blk_rq_pos(req) * VDISK_SECTOR_SIZE;
-    int dir = rq_data_dir(req);
-
-    if (offset + blk_rq_cur_bytes(req) > dev->size) {
-        pr_err("vdisk: Запрос за пределами устройства. offset=%lu, size=%u\n",
-               offset, dev->size);
-        blk_mq_end_request(req, BLK_STS_IOERR);
-        return BLK_STS_IOERR;
-    }
-
-    {
-        struct bio_vec bvec;
-        struct req_iterator iter;
-        rq_for_each_segment(bvec, req, iter) {
-            void *iovec_mem = kmap_atomic(bvec.bv_page);
-            if (dir == READ)
-                memcpy(iovec_mem + bvec.bv_offset, dev->data + offset, bvec.bv_len);
-            else
-                memcpy(dev->data + offset, iovec_mem + bvec.bv_offset, bvec.bv_len);
-            offset += bvec.bv_len;
-            kunmap_atomic(iovec_mem);
-        }
-    }
-
-    blk_mq_end_request(req, status);
-    return status;
-}
-
-/* Операции для blk-mq */
-static struct blk_mq_ops vdisk_mq_ops = {
-    .queue_rq = vdisk_mq_request,
-};
-
-/* Операции блочного устройства */
+/* Функции для работы с устройством (open/release) */
 static int vdisk_open(struct block_device *bdev, fmode_t mode)
 {
     return 0;
@@ -113,187 +65,195 @@ static int vdisk_open(struct block_device *bdev, fmode_t mode)
 
 static void vdisk_release(struct gendisk *gd, fmode_t mode)
 {
-    /* Дополнительных действий не требуется */
 }
 
-/*
- * IOCTL-обработчик для операций сохранения/восстановления образа
- */
-static int vdisk_ioctl(struct block_device *bdev, fmode_t mode,
-                       unsigned int cmd, unsigned long arg)
+/* Функция для получения «геометрии» устройства – нужна некоторым пользовательским утилитам */
+static int vdisk_getgeo(struct block_device *bdev, struct hd_geometry *geo)
 {
-    int ret = 0;
-    struct vdisk_dev *dev = bdev->bd_disk->private_data;
-    struct file *filp_image;
-    loff_t pos;
-    char *filename = NULL;
-    ssize_t err;
-
-    switch (cmd) {
-    case VDISK_IOCTL_SAVE_IMAGE:
-        filename = kmalloc(256, GFP_KERNEL);
-        if (!filename)
-            return -ENOMEM;
-        if (copy_from_user(filename, (char __user *)arg, 255)) {
-            kfree(filename);
-            return -EFAULT;
-        }
-        filename[255] = '\0';
-        pr_info("vdisk: Сохранение образа в файл: %s\n", filename);
-
-        filp_image = filp_open(filename, O_WRONLY | O_CREAT, 0644);
-        if (IS_ERR(filp_image)) {
-            ret = PTR_ERR(filp_image);
-            kfree(filename);
-            return ret;
-        }
-        pos = 0;
-        err = kernel_write(filp_image, dev->data, dev->size, &pos);
-        filp_close(filp_image, NULL);
-        if (err < 0) {
-            kfree(filename);
-            return err;
-        }
-        kfree(filename);
-        break;
-
-    case VDISK_IOCTL_LOAD_IMAGE:
-        filename = kmalloc(256, GFP_KERNEL);
-        if (!filename)
-            return -ENOMEM;
-        if (copy_from_user(filename, (char __user *)arg, 255)) {
-            kfree(filename);
-            return -EFAULT;
-        }
-        filename[255] = '\0';
-        pr_info("vdisk: Восстановление образа из файла: %s\n", filename);
-
-        filp_image = filp_open(filename, O_RDONLY, 0);
-        if (IS_ERR(filp_image)) {
-            ret = PTR_ERR(filp_image);
-            kfree(filename);
-            return ret;
-        }
-        pos = 0;
-        err = kernel_read(filp_image, dev->data, dev->size, &pos);
-        filp_close(filp_image, NULL);
-        if (err < 0) {
-            kfree(filename);
-            return err;
-        }
-        kfree(filename);
-        break;
-
-    default:
-        return -ENOTTY;
-    }
-
+    geo->heads = 4;
+    geo->sectors = 16;
+    geo->cylinders = vdisk_device->size / (4 * 16 * VDISK_SECTOR_SIZE);
+    geo->start = 0;
     return 0;
 }
 
-static struct block_device_operations vdisk_fops = {
-    .owner   = THIS_MODULE,
-    .open    = vdisk_open,
+/* Обработка ioctl-запросов: сохранение и восстановление образа */
+static long vdisk_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
+{
+    struct vdisk_dev *dev = vdisk_device; /* Для простоты рассматриваем только одно устройство */
+    struct file *filp;
+    loff_t pos = 0;
+    ssize_t ret;
+
+    switch (cmd) {
+    case VDISK_IOCTL_SAVE:
+        filp = filp_open(vdisk_image, O_WRONLY | O_CREAT, 0644);
+        if (IS_ERR(filp))
+            return PTR_ERR(filp);
+        ret = kernel_write(filp, dev->data, dev->size, &pos);
+        filp_close(filp, NULL);
+        if (ret < 0)
+            return ret;
+        printk(KERN_INFO "vdisk: Образ сохранён в %s\n", vdisk_image);
+        break;
+    case VDISK_IOCTL_RESTORE:
+        filp = filp_open(vdisk_image, O_RDONLY, 0);
+        if (IS_ERR(filp))
+            return PTR_ERR(filp);
+        ret = kernel_read(filp, dev->data, dev->size, &pos);
+        filp_close(filp, NULL);
+        if (ret < 0)
+            return ret;
+        printk(KERN_INFO "vdisk: Образ восстановлен из %s\n", vdisk_image);
+        break;
+    default:
+        return -ENOTTY;
+    }
+    return 0;
+}
+
+static const struct block_device_operations vdisk_fops = {
+    .owner = THIS_MODULE,
+    .open = vdisk_open,
     .release = vdisk_release,
-    .ioctl   = vdisk_ioctl,
+    .unlocked_ioctl = vdisk_ioctl,
+    .getgeo = vdisk_getgeo,
 };
 
 /*
- * Инициализация драйвера
+ * Реализация функции обработки запросов блочного устройства с использованием blk-mq.
+ * Функция вызывается для каждого bio-запроса.
  */
+static blk_qc_t vdisk_make_request(struct request_queue *q, struct bio *bio)
+{
+    struct vdisk_dev *dev = bio->bi_disk->private_data;
+    struct bio_vec bvec;
+    struct bvec_iter iter;
+    sector_t sector = bio->bi_iter.bi_sector;
+    unsigned int offset = 0;
+    unsigned int nbytes;
+    unsigned long dev_offset;
+
+    /* Проверка выхода за границы выделенной памяти */
+    if ((sector * VDISK_SECTOR_SIZE) >= dev->size) {
+        bio_io_error(bio);
+        return BLK_QC_T_NONE;
+    }
+
+    bio_for_each_segment(bvec, bio, iter) {
+        nbytes = bvec.bv_len;
+        dev_offset = (sector * VDISK_SECTOR_SIZE) + offset;
+        if ((dev_offset + nbytes) > dev->size) {
+            bio_io_error(bio);
+            return BLK_QC_T_NONE;
+        }
+        if (bio_data_dir(bio) == WRITE)
+            memcpy(dev->data + dev_offset, page_address(bvec.bv_page) + bvec.bv_offset, nbytes);
+        else
+            memcpy(page_address(bvec.bv_page) + bvec.bv_offset, dev->data + dev_offset, nbytes);
+        offset += nbytes;
+    }
+    bio_endio(bio);
+    return BLK_QC_T_NONE;
+}
+
+static struct blk_mq_ops vdisk_mq_ops = {
+    .queue_rq = vdisk_make_request,
+};
+
 static int __init vdisk_init(void)
 {
     int ret;
 
-    device = kmalloc(sizeof(struct vdisk_dev), GFP_KERNEL);
-    if (!device)
+    vdisk_device = kzalloc(sizeof(struct vdisk_dev), GFP_KERNEL);
+    if (!vdisk_device)
         return -ENOMEM;
-    memset(device, 0, sizeof(struct vdisk_dev));
-    device->size = VDISK_SIZE;
-    spin_lock_init(&device->lock);
 
-    device->data = vmalloc(device->size);
-    if (!device->data) {
-        kfree(device);
+    vdisk_device->size = VDISK_NUM_SECTORS * VDISK_SECTOR_SIZE;
+    vdisk_device->data = vmalloc(vdisk_device->size);
+    if (!vdisk_device->data) {
+        kfree(vdisk_device);
         return -ENOMEM;
     }
-    memset(device->data, 0, device->size);
+    spin_lock_init(&vdisk_device->lock);
 
-    memset(&vdisk_tag_set, 0, sizeof(vdisk_tag_set));
-    vdisk_tag_set.ops = &vdisk_mq_ops;
-    vdisk_tag_set.nr_hw_queues = 1;
-    vdisk_tag_set.queue_depth = 128;
-    vdisk_tag_set.numa_node = NUMA_NO_NODE;
-    vdisk_tag_set.cmd_size = 0;
-    vdisk_tag_set.flags = 0;
+    ret = register_blkdev(VDISK_MAJOR, "vdisk");
+    if (ret < 0) {
+        printk(KERN_ERR "vdisk: Не удалось получить major number\n");
+        vfree(vdisk_device->data);
+        kfree(vdisk_device);
+        return ret;
+    }
 
-    ret = blk_mq_alloc_tag_set(&vdisk_tag_set);
+    vdisk_tag_set = kzalloc(sizeof(*vdisk_tag_set), GFP_KERNEL);
+    if (!vdisk_tag_set) {
+        unregister_blkdev(VDISK_MAJOR, "vdisk");
+        vfree(vdisk_device->data);
+        kfree(vdisk_device);
+        return -ENOMEM;
+    }
+    vdisk_tag_set->ops = &vdisk_mq_ops;
+    vdisk_tag_set->nr_hw_queues = 1;
+    vdisk_tag_set->queue_depth = 128;
+    vdisk_tag_set->numa_node = NUMA_NO_NODE;
+    vdisk_tag_set->cmd_size = 0;
+    vdisk_tag_set->flags = BLK_MQ_F_SHOULD_MERGE;
+
+    ret = blk_mq_alloc_tag_set(vdisk_tag_set);
     if (ret) {
-        vfree(device->data);
-        kfree(device);
+        kfree(vdisk_tag_set);
+        unregister_blkdev(VDISK_MAJOR, "vdisk");
+        vfree(vdisk_device->data);
+        kfree(vdisk_device);
         return ret;
     }
 
-    device->queue = blk_mq_init_queue(&vdisk_tag_set);
-    if (IS_ERR(device->queue)) {
-        ret = PTR_ERR(device->queue);
-        blk_mq_free_tag_set(&vdisk_tag_set);
-        vfree(device->data);
-        kfree(device);
+    vdisk_device->queue = blk_mq_init_queue(vdisk_tag_set);
+    if (IS_ERR(vdisk_device->queue)) {
+        ret = PTR_ERR(vdisk_device->queue);
+        blk_mq_free_tag_set(vdisk_tag_set);
+        kfree(vdisk_tag_set);
+        unregister_blkdev(VDISK_MAJOR, "vdisk");
+        vfree(vdisk_device->data);
+        kfree(vdisk_device);
         return ret;
     }
-    device->queue->queuedata = device;
+    vdisk_device->queue->queuedata = vdisk_device;
 
-    major_num = register_blkdev(0, "vdisk");
-    if (major_num <= 0) {
-        /* Для ядра 6.1 используем blk_cleanup_queue */
-        blk_cleanup_queue(device->queue);
-        blk_mq_free_tag_set(&vdisk_tag_set);
-        vfree(device->data);
-        kfree(device);
-        return -EBUSY;
-    }
-
-    /* Для ядра 6.1 используем alloc_disk(), так как alloc_disk_node отсутствует */
-    device->gd = alloc_disk(VDISK_MINOR_CNT);
-    if (!device->gd) {
-        unregister_blkdev(major_num, "vdisk");
-        blk_cleanup_queue(device->queue);
-        blk_mq_free_tag_set(&vdisk_tag_set);
-        vfree(device->data);
-        kfree(device);
+    vdisk_device->gd = alloc_disk(VDISK_MINOR_CNT);
+    if (!vdisk_device->gd) {
+        blk_cleanup_queue(vdisk_device->queue);
+        blk_mq_free_tag_set(vdisk_tag_set);
+        kfree(vdisk_tag_set);
+        unregister_blkdev(VDISK_MAJOR, "vdisk");
+        vfree(vdisk_device->data);
+        kfree(vdisk_device);
         return -ENOMEM;
     }
+    vdisk_device->gd->major = VDISK_MAJOR;
+    vdisk_device->gd->first_minor = 0;
+    vdisk_device->gd->fops = &vdisk_fops;
+    vdisk_device->gd->private_data = vdisk_device;
+    snprintf(vdisk_device->gd->disk_name, 32, "vdisk");
+    set_capacity(vdisk_device->gd, VDISK_NUM_SECTORS);
+    vdisk_device->gd->queue = vdisk_device->queue;
 
-    device->gd->major = major_num;
-    device->gd->first_minor = 0;
-    device->gd->fops = &vdisk_fops;
-    device->gd->private_data = device;
-    snprintf(device->gd->disk_name, 32, "vdisk0");
-    set_capacity(device->gd, device->size / VDISK_SECTOR_SIZE);
-    device->gd->queue = device->queue;
-
-    (void)add_disk(device->gd);
-
-    pr_info("vdisk: Драйвер загружен. major = %d, размер = %u байт\n",
-            major_num, device->size);
+    add_disk(vdisk_device->gd);
+    printk(KERN_INFO "vdisk: Модуль загружен. Размер диска: %d байт.\n", vdisk_device->size);
     return 0;
 }
 
-/*
- * Выгрузка драйвера
- */
 static void __exit vdisk_exit(void)
 {
-    del_gendisk(device->gd);
-    put_disk(device->gd);
-    unregister_blkdev(major_num, "vdisk");
-    /* Для очередей, созданных через blk_mq_init_queue, используем blk_cleanup_queue */
-    blk_cleanup_queue(device->queue);
-    blk_mq_free_tag_set(&vdisk_tag_set);
-    vfree(device->data);
-    kfree(device);
-    pr_info("vdisk: Драйвер выгружен\n");
+    del_gendisk(vdisk_device->gd);
+    put_disk(vdisk_device->gd);
+    blk_cleanup_queue(vdisk_device->queue);
+    blk_mq_free_tag_set(vdisk_tag_set);
+    kfree(vdisk_tag_set);
+    unregister_blkdev(VDISK_MAJOR, "vdisk");
+    vfree(vdisk_device->data);
+    kfree(vdisk_device);
+    printk(KERN_INFO "vdisk: Модуль выгружен.\n");
 }
 
 module_init(vdisk_init);
@@ -301,4 +261,5 @@ module_exit(vdisk_exit);
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Neverov Zakhar");
-MODULE_DESCRIPTION("Виртуальный диск с сохранением/восстановлением образа для ядра 6.1.0-31-amd64");
+MODULE_DESCRIPTION("Драйвер виртуального диска с сохранением и восстановлением образа");
+

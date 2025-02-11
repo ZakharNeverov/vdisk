@@ -1,21 +1,21 @@
 /*
- * vdisk.c - Пример драйвера виртуального блочного устройства с сохранением/восстановлением образа
- * для ядра 6.1.0-31-amd64 с использованием blk-mq
+ * vdisk.c - Пример драйвера виртуального блочного устройства
+ * с поддержкой сохранения/восстановления образа для ядра 6.1.0-31-amd64.
  *
  * Для сборки:
- *  - Сохраните этот код в файл vdisk.c.
- *  - Создайте Makefile (см. ниже) и выполните: make
+ *   - Сохраните этот код в файл vdisk.c.
+ *   - Создайте рядом Makefile со следующим содержимым:
  *
- * Пример Makefile:
- * -------------------------------------------------
- * obj-m += vdisk.o
+ *       obj-m += vdisk.o
+ *       all:
+ *           make -C /lib/modules/$(shell uname -r)/build M=$(PWD) modules
+ *       clean:
+ *           make -C /lib/modules/$(shell uname -r)/build M=$(PWD) clean
  *
- * all:
- *	   make -C /lib/modules/$(shell uname -r)/build M=$(PWD) modules
- *
- * clean:
- *	   make -C /lib/modules/$(shell uname -r)/build M=$(PWD) clean
- * -------------------------------------------------
+ * Замечание:
+ *   Для освобождения очереди используется blk_mq_free_queue(), а для выделения
+ *   структуры диска – alloc_disk_node(), так как в новых ядрах header <linux/genhd.h>
+ *   удалён.
  */
 
 #include <linux/module.h>
@@ -30,6 +30,7 @@
 #include <linux/ioctl.h>
 #include <linux/fs.h>
 
+/* Параметры виртуального диска */
 #define VDISK_MINOR_CNT      16
 #define VDISK_SECTOR_SIZE    512
 #define VDISK_SIZE           (16 * 1024 * 1024)  /* 16 МБ */
@@ -55,7 +56,7 @@ static struct vdisk_dev *device = NULL;
 static struct blk_mq_tag_set vdisk_tag_set;
 
 /*
- * Если функция blk_mq_rq_to_disk отсутствует в заголовках, определяем её сами.
+ * Если функция blk_mq_rq_to_disk не объявлена, определяем её самостоятельно.
  */
 #ifndef blk_mq_rq_to_disk
 static inline struct gendisk *blk_mq_rq_to_disk(struct request *rq)
@@ -65,7 +66,7 @@ static inline struct gendisk *blk_mq_rq_to_disk(struct request *rq)
 #endif
 
 /*
- * Функция-обработчик запросов через blk-mq.
+ * Функция-обработчик запросов (blk-mq).
  */
 static blk_status_t vdisk_mq_request(struct blk_mq_hw_ctx *hctx,
                                      const struct blk_mq_queue_data *bd)
@@ -108,7 +109,7 @@ static struct blk_mq_ops vdisk_mq_ops = {
     .queue_rq = vdisk_mq_request,
 };
 
-/* Операции блочного устройства */
+/* Функции открытия/закрытия блочного устройства */
 static int vdisk_open(struct block_device *bdev, fmode_t mode)
 {
     return 0;
@@ -116,7 +117,7 @@ static int vdisk_open(struct block_device *bdev, fmode_t mode)
 
 static void vdisk_release(struct gendisk *gd, fmode_t mode)
 {
-    /* Дополнительных действий не требуется */
+    /* Ничего особенного не требуется */
 }
 
 /*
@@ -201,6 +202,9 @@ static struct block_device_operations vdisk_fops = {
     .ioctl   = vdisk_ioctl,
 };
 
+/*
+ * Инициализация драйвера
+ */
 static int __init vdisk_init(void)
 {
     int ret;
@@ -246,19 +250,18 @@ static int __init vdisk_init(void)
 
     major_num = register_blkdev(0, "vdisk");
     if (major_num <= 0) {
-        /* Для ядра 6.1 используем blk_cleanup_queue */
-        blk_cleanup_queue(device->queue);
+        blk_mq_free_queue(device->queue);
         blk_mq_free_tag_set(&vdisk_tag_set);
         vfree(device->data);
         kfree(device);
         return -EBUSY;
     }
 
-    /* Для ядра 6.1 используем alloc_disk() */
-    device->gd = alloc_disk(VDISK_MINOR_CNT);
+    /* Используем alloc_disk_node вместо alloc_disk */
+    device->gd = alloc_disk_node(VDISK_MINOR_CNT, NUMA_NO_NODE);
     if (!device->gd) {
         unregister_blkdev(major_num, "vdisk");
-        blk_cleanup_queue(device->queue);
+        blk_mq_free_queue(device->queue);
         blk_mq_free_tag_set(&vdisk_tag_set);
         vfree(device->data);
         kfree(device);
@@ -280,12 +283,16 @@ static int __init vdisk_init(void)
     return 0;
 }
 
+/*
+ * Выгрузка драйвера
+ */
 static void __exit vdisk_exit(void)
 {
     del_gendisk(device->gd);
     put_disk(device->gd);
     unregister_blkdev(major_num, "vdisk");
-    blk_cleanup_queue(device->queue);
+    /* Для очередей, созданных через blk_mq_init_queue, используем blk_mq_free_queue */
+    blk_mq_free_queue(device->queue);
     blk_mq_free_tag_set(&vdisk_tag_set);
     vfree(device->data);
     kfree(device);
@@ -298,3 +305,4 @@ module_exit(vdisk_exit);
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Neverov Zakhar");
 MODULE_DESCRIPTION("Виртуальный диск с сохранением/восстановлением образа для ядра 6.1.0-31-amd64");
+

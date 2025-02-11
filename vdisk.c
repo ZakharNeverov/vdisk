@@ -77,7 +77,8 @@ static int vdisk_getgeo(struct block_device *bdev, struct hd_geometry *geo)
 }
 
 /* Обработка ioctl-запросов: сохранение и восстановление образа */
-static long vdisk_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
+static int vdisk_ioctl(struct block_device *bdev, fmode_t mode,
+                       unsigned int cmd, unsigned long arg)
 {
     struct vdisk_dev *dev = vdisk_device; /* Для простоты рассматриваем только одно устройство */
     struct file *filp;
@@ -89,7 +90,6 @@ static long vdisk_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
         filp = filp_open(vdisk_image, O_WRONLY | O_CREAT, 0644);
         if (IS_ERR(filp))
             return PTR_ERR(filp);
-        /* Передаём pos по значению, а не адресом */
         ret = kernel_write(filp, dev->data, dev->size, pos);
         filp_close(filp, NULL);
         if (ret < 0)
@@ -100,7 +100,6 @@ static long vdisk_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
         filp = filp_open(vdisk_image, O_RDONLY, 0);
         if (IS_ERR(filp))
             return PTR_ERR(filp);
-        /* В kernel_read смещение передаётся по значению; параметры меняем местами */
         ret = kernel_read(filp, pos, dev->data, dev->size);
         filp_close(filp, NULL);
         if (ret < 0)
@@ -122,40 +121,43 @@ static const struct block_device_operations vdisk_fops = {
 };
 
 /*
- * Функция обработки bio-запросов.
- * Вызывается для каждого bio-запроса.
+ * Функция обработки запросов legacy-интерфейса.
+ * Вызывается для каждого запроса, полученного через очередь.
  */
-static void vdisk_make_request(struct request_queue *q, struct bio *bio)
+static void vdisk_request(struct request_queue *q)
 {
-    /* Используем поле bi_bdev вместо bi_disk */
-    struct vdisk_dev *dev = bio->bi_bdev->bd_disk->private_data;
-    struct bio_vec bvec;
-    struct bvec_iter iter;
-    sector_t sector = bio->bi_iter.bi_sector;
-    unsigned int offset = 0;
-    unsigned int nbytes;
-    unsigned long dev_offset;
-
-    /* Проверка выхода за границы выделенной памяти */
-    if ((sector * VDISK_SECTOR_SIZE) >= dev->size) {
-        bio_io_error(bio);
-        return;
-    }
-
-    bio_for_each_segment(bvec, bio, iter) {
-        nbytes = bvec.bv_len;
-        dev_offset = (sector * VDISK_SECTOR_SIZE) + offset;
-        if ((dev_offset + nbytes) > dev->size) {
-            bio_io_error(bio);
-            return;
+    struct request *req;
+    while ((req = blk_fetch_request(q)) != NULL) {
+        struct vdisk_dev *dev = req->rq_disk->private_data;
+        sector_t sector = blk_rq_pos(req);
+        unsigned int offset = 0;
+        unsigned int nbytes;
+        int ret = 0;
+        struct bio_vec bv;
+        struct req_iterator iter;
+        
+        if (blk_rq_is_passthrough(req)) {
+            __blk_end_request_all(req, -EIO);
+            continue;
         }
-        if (bio_data_dir(bio) == WRITE)
-            memcpy(dev->data + dev_offset, page_address(bvec.bv_page) + bvec.bv_offset, nbytes);
-        else
-            memcpy(page_address(bvec.bv_page) + bvec.bv_offset, dev->data + dev_offset, nbytes);
-        offset += nbytes;
+
+        rq_for_each_segment(bv, req, iter) {
+            nbytes = bv.bv_len;
+            {
+                unsigned long dev_offset = (sector * VDISK_SECTOR_SIZE) + offset;
+                if ((dev_offset + nbytes) > dev->size) {
+                    ret = -EIO;
+                    break;
+                }
+                if (rq_data_dir(req) == WRITE)
+                    memcpy(dev->data + dev_offset, page_address(bv.bv_page) + bv.bv_offset, nbytes);
+                else
+                    memcpy(page_address(bv.bv_page) + bv.bv_offset, dev->data + dev_offset, nbytes);
+            }
+            offset += nbytes;
+        }
+        __blk_end_request_all(req, ret);
     }
-    bio_endio(bio);
 }
 
 /* Инициализация модуля */
@@ -184,7 +186,7 @@ static int __init vdisk_init(void)
     }
 
     /* Инициализируем очередь запросов legacy-интерфейсом */
-    vdisk_device->queue = blk_init_queue(vdisk_make_request, &vdisk_device->lock);
+    vdisk_device->queue = blk_init_queue(vdisk_request, &vdisk_device->lock);
     if (!vdisk_device->queue) {
         unregister_blkdev(VDISK_MAJOR, "vdisk");
         vfree(vdisk_device->data);
@@ -231,3 +233,4 @@ module_exit(vdisk_exit);
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Neverov Zakhar");
 MODULE_DESCRIPTION("Драйвер виртуального диска с сохранением и восстановлением образа");
+

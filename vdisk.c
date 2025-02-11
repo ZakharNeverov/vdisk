@@ -36,7 +36,6 @@
 #define VDISK_SECTOR_SIZE   512
 #define VDISK_NUM_SECTORS   2048  /* 2048 секторов по 512 байт – около 1 МБ */
 
-/* Путь к файлу для сохранения/восстановления образа можно задать как параметр модуля */
 static char *vdisk_image = "/var/vdisk.img";
 module_param(vdisk_image, charp, 0644);
 MODULE_PARM_DESC(vdisk_image, "Путь к файлу для сохранения/восстановления образа виртуального диска");
@@ -45,18 +44,16 @@ MODULE_PARM_DESC(vdisk_image, "Путь к файлу для сохранени�
 #define VDISK_IOCTL_SAVE    _IO(VDISK_IOCTL_MAGIC, 1)
 #define VDISK_IOCTL_RESTORE _IO(VDISK_IOCTL_MAGIC, 2)
 
-/* Структура, описывающая устройство */
 struct vdisk_dev {
-    int size;          /* Размер устройства в байтах */
-    u8 *data;          /* Указатель на область памяти, где хранятся данные */
-    spinlock_t lock;   /* Мьютекс для синхронизации */
+    int size;
+    u8 *data;
+    spinlock_t lock;
     struct request_queue *queue;
     struct gendisk *gd;
 };
 
 static struct vdisk_dev *vdisk_device = NULL;
 
-/* Функции для работы с устройством (open/release) */
 static int vdisk_open(struct block_device *bdev, fmode_t mode)
 {
     return 0;
@@ -66,7 +63,6 @@ static void vdisk_release(struct gendisk *gd, fmode_t mode)
 {
 }
 
-/* Функция для получения «геометрии» устройства – нужна некоторым пользовательским утилитам */
 static int vdisk_getgeo(struct block_device *bdev, struct hd_geometry *geo)
 {
     geo->heads = 4;
@@ -76,11 +72,10 @@ static int vdisk_getgeo(struct block_device *bdev, struct hd_geometry *geo)
     return 0;
 }
 
-/* Обработка ioctl-запросов: сохранение и восстановление образа */
 static int vdisk_ioctl(struct block_device *bdev, fmode_t mode,
                        unsigned int cmd, unsigned long arg)
 {
-    struct vdisk_dev *dev = vdisk_device; /* Для простоты рассматриваем только одно устройство */
+    struct vdisk_dev *dev = vdisk_device;
     struct file *filp;
     loff_t pos = 0;
     ssize_t ret;
@@ -120,10 +115,6 @@ static const struct block_device_operations vdisk_fops = {
     .getgeo = vdisk_getgeo,
 };
 
-/*
- * Функция обработки запросов legacy-интерфейса.
- * Вызывается для каждого запроса, полученного через очередь.
- */
 static void vdisk_request(struct request_queue *q)
 {
     struct request *req;
@@ -160,7 +151,6 @@ static void vdisk_request(struct request_queue *q)
     }
 }
 
-/* Инициализация модуля */
 static int __init vdisk_init(void)
 {
     int ret;
@@ -185,7 +175,6 @@ static int __init vdisk_init(void)
         return ret;
     }
 
-    /* Инициализируем очередь запросов legacy-интерфейсом */
     vdisk_device->queue = blk_init_queue(vdisk_request, &vdisk_device->lock);
     if (!vdisk_device->queue) {
         unregister_blkdev(VDISK_MAJOR, "vdisk");
